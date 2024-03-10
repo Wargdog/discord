@@ -1,0 +1,232 @@
+import discord
+from discord.ext import commands
+from pytube import YouTube
+import os
+import aiohttp
+import re
+import asyncio
+import pytube
+
+intents = discord.Intents.default()
+intents.voice_states = True
+intents.message_content = True
+
+youtube_api_key = "token"
+discord_token = "token"
+
+class BotClient(commands.Bot):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.queue = []
+        self.loop = asyncio.get_event_loop()
+
+    async def join(self, ctx):
+        if ctx.author.voice:
+            channel = ctx.author.voice.channel
+            await channel.connect()
+
+    async def leave(self, ctx):
+        if ctx.voice_client:
+            await ctx.voice_client.disconnect()
+
+    async def pobierz_audio(self, query):
+        yt = YouTube(query)
+        stream = yt.streams.filter(only_audio=True).first()
+        if not os.path.exists("downloads"):
+            os.makedirs("downloads")
+        audio_path = stream.download(output_path="downloads", filename="song")
+        return audio_path
+
+    async def znajdz_wideo(self, query):
+        search_url = f"https://www.youtube.com/results?search_query={query}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(search_url) as response:
+                if response.status == 200:
+                    html = await response.text()
+                    match = re.search(r"/watch\?v=([A-Za-z0-9_-]{11})", html)
+                    if match:
+                        video_id = match.group(1)
+                        return f"https://www.youtube.com/watch?v={video_id}"
+        return None
+
+    async def play_next(self, ctx):
+        if not ctx.voice_client.is_playing() and self.queue:
+            next_song = self.queue.pop(0)
+            await self.play_song(ctx, next_song)
+
+    async def play_song(self, ctx, query):
+        voice_channel = ctx.author.voice.channel
+        if not voice_channel:
+            await ctx.send("musisz być na kanale głosowym, aby odtwarzać muzykę.")
+            return
+
+        video_url = await self.znajdz_wideo(query)
+        if video_url:
+            yt = pytube.YouTube(video_url)
+            title = yt.title
+            duration = yt.length
+            channel = yt.author
+            thumbnail_url = yt.thumbnail_url
+
+            audio_path = await self.pobierz_audio(video_url)
+            if audio_path:
+                voice_client = ctx.voice_client
+                if voice_client.is_playing():
+                    voice_client.stop()
+
+                await asyncio.sleep(0.5)
+
+                audio_source = discord.FFmpegPCMAudio(audio_path)
+
+                voice_client.play(audio_source, after=lambda e: self.loop.create_task(self.play_next(ctx)))
+
+                embed = discord.Embed(title="Teraz leci:", description=f"**{title}**", color=0xFF5733)
+                embed.set_author(name=f"Kanał: {channel}")
+                embed.add_field(name="Czas", value=f"{duration // 60}:{duration % 60:02}", inline=False)
+                embed.set_thumbnail(url=thumbnail_url)
+                message = await ctx.send(embed=embed, view=self.generate_button_view())
+
+                while voice_client.is_playing():
+                    await asyncio.sleep(1)
+            else:
+                await ctx.send("Wystąpił błąd podczas pobierania audio.")
+        else:
+            await ctx.send("Nie znaleziono wideo pasującego do zapytania.")
+
+    async def play(self, ctx, query=None):
+        if query:
+            self.queue.append(query)
+
+        if not ctx.voice_client.is_playing() and self.queue:
+            query = self.queue.pop(0)
+            await self.play_song(ctx, query)
+
+    async def clear_playlist(self, ctx):
+        if self.queue:
+            self.queue.clear()
+            await ctx.send("Playlista została wyczyszczona.")
+
+    def generate_button_view(self):
+        view = discord.ui.View()
+        button_play = discord.ui.Button(label="Play", style=discord.ButtonStyle.primary, custom_id="play")
+        view.add_item(button_play)
+        button_pause = discord.ui.Button(label="Pause", style=discord.ButtonStyle.secondary, custom_id="pause")
+        view.add_item(button_pause)
+        button_skip = discord.ui.Button(label="Skip", style=discord.ButtonStyle.secondary, custom_id="skip")
+        view.add_item(button_skip)
+        return view
+
+class AudioSourceTracked(discord.AudioSource):
+    def __init__(self, source):
+        self._source = source
+        self.count_20ms = 0
+
+    def read(self) -> bytes:
+        data = self._source.read()
+        if data:
+            self.count_20ms += 1
+        return data
+
+    @property
+    def progress(self) -> float:
+        return self.count_20ms * 0.02
+
+bot = BotClient(command_prefix='!', intents=intents)
+
+
+@bot.command()
+async def join(ctx):
+    await bot.join(ctx)
+
+
+@bot.command()
+async def leave(ctx):
+    await bot.leave(ctx)
+
+
+@bot.command()
+async def siema(ctx):
+    author_nick = ctx.author.display_name
+    await ctx.send(f"siema {author_nick}!")
+
+
+@bot.command()
+async def pomoc(ctx):
+    commands_list = [
+        "!kupa",
+        "!gowno",
+        "!chuj"
+    ]
+    await ctx.send("Komendy:\n" + "\n".join(commands_list))
+
+
+@bot.command()
+async def play(ctx, *, query):
+    await bot.play(ctx, query)
+
+
+@bot.command()
+async def pause(ctx):
+    voice_client = ctx.voice_client
+    if voice_client and voice_client.is_playing():
+        voice_client.pause()
+        await ctx.send("Paused")
+    elif voice_client and voice_client.is_paused():
+        await ctx.send("Odtwarzanie jest już zatrzymane.")
+    else:
+        await ctx.send("Nic nie jest odtwarzane.")
+
+
+@bot.command()
+async def resume(ctx):
+    voice_client = ctx.voice_client
+    if voice_client and voice_client.is_paused():
+        voice_client.resume()
+        await ctx.send("Resumed")
+    elif voice_client and voice_client.is_playing():
+        await ctx.send("Odtwarzanie jest już wznowione.")
+    else:
+        await ctx.send("Nic nie jest odtwarzane.")
+
+
+@bot.command()
+async def skip(ctx):
+    voice_client = ctx.voice_client
+    if voice_client and voice_client.is_playing():
+        voice_client.stop()
+        await ctx.send("Skipped")
+
+
+@bot.command()
+async def playlist(ctx):
+    if bot.queue:
+        await ctx.send("Playlista:")
+        for index, song in enumerate(bot.queue, start=1):
+            await ctx.send(f"{index}. {song}")
+    else:
+        await ctx.send("Playlista jest pusta.")
+
+
+@bot.command()
+async def clear(ctx):
+    await bot.clear_playlist(ctx)
+
+
+@bot.event
+async def on_button_click(interaction):
+    if interaction.component.label == 'Play':
+        await interaction.response.defer()
+        ctx = await bot.get_context(interaction.message)
+        await ctx.invoke(bot.get_command('play'))
+    elif interaction.component.label == 'Pause':
+        await interaction.response.defer()
+        ctx = await bot.get_context(interaction.message)
+        await ctx.invoke(bot.get_command('pause'))
+    elif interaction.component.label == 'Skip':
+        await interaction.response.defer()
+        ctx = await bot.get_context(interaction.message)
+        await ctx.invoke(bot.get_command('skip'))
+
+
+
+bot.run(discord_token)
